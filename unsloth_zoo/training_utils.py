@@ -142,7 +142,8 @@ def prepare_model_for_training(
         upcast = False
         requires_grad = False
         if not full_finetuning:
-            if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
+            if (".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name
+                or ".trainable_tokens_delta" in name):
                 upcast = True
                 requires_grad = True
             else:
