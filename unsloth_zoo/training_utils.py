@@ -142,7 +142,11 @@ def prepare_model_for_training(
         upcast = False
         requires_grad = False
         if not full_finetuning:
-            if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
+            # TODO above, get adapter_layer_names for all layers (that have adapter_layer_names attr 
+            # and build white list of patterns to match 
+            # instead of hard coding the matches below
+            if (".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name
+                    or ".trainable_tokens_delta" in name):
                 upcast = True
                 requires_grad = True
             else:
