@@ -65,15 +65,20 @@ from functools import lru_cache
 
 
 import requests
-import torchvision
 from packaging import version
 from typing import Union, Tuple, List, Dict, Sequence
 from itertools import takewhile
+# torchvision is an optional dependency: the video reader path uses it but
+# the rest of vision_utils (image preprocessing, HF picker integration)
+# works without it. Guard the top-level import so a CPU-only zoo install
+# without torchvision can still import this module.
 try:
+    import torchvision
     from torchvision import io, transforms
     from torchvision.transforms import InterpolationMode
     HAS_TORCHVISION = True
 except Exception:
+    torchvision = None
     HAS_TORCHVISION = False
 
 from .log import logger
@@ -86,6 +91,9 @@ IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
 MAX_PIXELS = 16384 * 28 * 28
 MAX_RATIO = 200
+
+# Fire degenerate-aspect warning once per process.
+_WARNED_DEGENERATE_ASPECT = False
 
 VIDEO_MIN_PIXELS = 128 * 28 * 28
 VIDEO_MAX_PIXELS = 768 * 28 * 28
@@ -660,6 +668,7 @@ class UnslothVisionDataCollator:
         pad_to_multiple_of = None,
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
+        last_response_only = False, # Train only on the last assistant turn
     ):
         if not hasattr(processor, "image_processor"):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
@@ -733,12 +742,13 @@ class UnslothVisionDataCollator:
             assert(isinstance(instruction_part, str) and isinstance(response_part, str))
             self.train_on_responses_only = _train_on_responses_only(
                 None,
-                instruction_part = instruction_part,
-                response_part    = response_part,
-                force_match      = force_match,
-                tokenizer        = processor,
-                return_function  = True,
-                num_proc         = num_proc,
+                instruction_part   = instruction_part,
+                response_part      = response_part,
+                force_match        = force_match,
+                tokenizer          = processor,
+                return_function    = True,
+                num_proc           = num_proc,
+                last_response_only = last_response_only,
             )
         else:
             self.train_on_responses_only = None
@@ -965,18 +975,39 @@ class UnslothVisionDataCollator:
             return image or []
         # Resize images
         image_size = self.image_size
+        # Hoist loop invariants.
+        is_tuple = type(image_size) is tuple
+        snap = self.snap_to_patch_size
+        if snap:
+            factor = self.patch_size * 2
 
         for i, img in enumerate(image):
-            if type(image_size) is tuple:
+            if is_tuple:
                 image[i] = img.resize(image_size, LANCZOS)
-            elif self.size_func(img) > image_size and hasattr(img, "resize"):
+                continue
+            # Cache size_func(img) once.
+            side = self.size_func(img)
+            if side > image_size and hasattr(img, "resize"):
                 w, h = img.size
-                # integer math rounding
-                new_w = (w * image_size + self.size_func(img) // 2) // self.size_func(img)
-                new_h = (h * image_size + self.size_func(img) // 2) // self.size_func(img)
-                if self.snap_to_patch_size:
-                    factor = self.patch_size * 2
+                # max(1, _) avoids zero-side crash on degenerate aspect ratios.
+                new_w = max(1, (w * image_size + side // 2) // side)
+                new_h = max(1, (h * image_size + side // 2) // side)
+                if snap:
                     new_w, new_h = quantize_to_factor(new_w), quantize_to_factor(new_h)
+
+                # Qwen2-VL smart_resize rejects aspect > MAX_RATIO; warn once.
+                global _WARNED_DEGENERATE_ASPECT
+                if (not _WARNED_DEGENERATE_ASPECT
+                        and max(new_w, new_h) > MAX_RATIO * min(new_w, new_h)):
+                    _WARNED_DEGENERATE_ASPECT = True
+                    warnings.warn(
+                        f"Unsloth: {w}x{h} -> ({new_w}, {new_h}) aspect "
+                        f"{max(new_w, new_h) // min(new_w, new_h)} > "
+                        f"MAX_RATIO={MAX_RATIO}. Qwen2-VL/2.5-VL will reject; "
+                        "filter degenerate-aspect images from your dataset.",
+                        UserWarning,
+                        stacklevel = 2,
+                    )
 
                 image[i] = img.resize((new_w, new_h), LANCZOS)
 

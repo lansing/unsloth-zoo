@@ -27,6 +27,7 @@ from .common import (
     _torch_compile,
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
+    UNSLOTH_COMPILE_DISABLE,
 )
 from importlib.metadata import version as importlib_version
 from ..utils import Version
@@ -897,20 +898,31 @@ class GptOssExpertsBnb4bit(nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        num_tokens = hidden_states.shape[0]
         num_experts = routing_weights.shape[1]
-
+        top_k = router_indices.shape[1]
+        
         if self.training:
+            with torch.no_grad():
+                flat_experts = router_indices.flatten()  # [tokens * topk]
+                token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+                
+                sorted_idx = flat_experts.argsort(stable=True)
+                sorted_tokens = token_ids[sorted_idx]
+                
+                counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
+            
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-            # with torch.no_grad():
-                # expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                # expert_mask = expert_mask.permute(2, 1, 0)
-                # expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            # for expert_idx in expert_hitted[:]:
+            offset = 0
+            
             for expert_idx in range(num_experts):
-                with torch.no_grad():
-                    # _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                    token_idx, _ = torch.where(router_indices == expert_idx)
+                count = counts[expert_idx]
+                if count == 0:
+                    continue
+                # Use pre-computed indices (no torch.where needed)
+                token_idx = sorted_tokens[offset:offset + count]
                 current_state = hidden_states[token_idx]
+                
                 gate_up = self.gate_up_projs[expert_idx](current_state)
                 gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
                 # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
@@ -919,8 +931,12 @@ class GptOssExpertsBnb4bit(nn.Module):
                 # glu = gate * torch.sigmoid(gate * self.alpha)
                 # gated_output = (up + 1) * glu
                 out = self.down_projs[expert_idx](gated_output)
+                
                 weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
                 next_states.index_add_(0, token_idx, weighted_output)
+                
+                offset += count
+            
             next_states = next_states.view(batch_size, -1, self.hidden_size)
             return next_states.to(hidden_states.dtype)
         else:
@@ -1095,6 +1111,31 @@ def restore_gpt_oss_original():
         pass
     return False
 
+def _normalized_unsloth_model_name() -> str:
+    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+
+
+def _should_use_gpt_oss_bnb4bit() -> bool:
+    """
+    Decide if GPT-OSS should use BnB-compatible 4-bit experts.
+    Default: True when load_in_4bit is active.
+    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
+    """
+    if "gpt_oss" not in _normalized_unsloth_model_name():
+        return False
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
+        return False
+    return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
+
+
+def _is_gpt_oss_4bit_load() -> bool:
+    return "_load_in_4bit_" in _normalized_unsloth_model_name()
+
+
+def _is_transformers_v5() -> bool:
+    return transformers_version >= Version("5.0.0.dev0")
+
+
 def patch_gpt_oss_bnb4bit_auto():
     """
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
@@ -1121,8 +1162,10 @@ from ..device_type import DEVICE_TYPE
 
 if DEVICE_TYPE == "xpu":
     device_memory = torch.xpu.memory.mem_get_info(0)[-1]
-else:
+elif DEVICE_TYPE in ("cuda", "hip"):
     device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+else:
+    device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
@@ -1330,31 +1373,6 @@ from .moe_utils import (
     forward_native_grouped_mm,
     # torch_native_forward,
 )
-
-
-def _should_use_gpt_oss_bnb4bit() -> bool:
-    """
-    Decide if GPT-OSS should use BnB-compatible 4-bit experts.
-    Default: True when load_in_4bit is active.
-    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to force BF16 path.
-    """
-    if "gpt_oss" not in _normalized_unsloth_model_name():
-        return False
-    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
-        return False
-    return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
-
-
-def _is_gpt_oss_4bit_load() -> bool:
-    return "_load_in_4bit_" in _normalized_unsloth_model_name()
-
-
-def _normalized_unsloth_model_name() -> str:
-    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
-
-
-def _is_transformers_v5() -> bool:
-    return transformers_version >= Version("5.0.0.dev0")
 
 
 def patch_gpt_oss_moe_for_lora():
@@ -1733,35 +1751,45 @@ def torch_native_forward(
 
     batch_size = hidden_states.shape[0]
     hidden_states = hidden_states.reshape(-1, self.hidden_size)
+    num_tokens = hidden_states.shape[0]
     num_experts = routing_weights.shape[1]
+    top_k = router_indices.shape[1]
+    
     if self.training:
+        with torch.no_grad():
+            flat_experts = router_indices.flatten()  # [tokens * topk]
+            token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+            
+            sorted_idx = flat_experts.argsort(stable=True)
+            sorted_tokens = token_ids[sorted_idx]
+            
+            counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
+        
         next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
-        # with torch.no_grad():
-        #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-        #     expert_mask = expert_mask.permute(2, 1, 0)
-        #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        # for expert_idx in expert_hitted[:]:
+        offset = 0
+        
         for expert_idx in range(num_experts):
-            with torch.no_grad():
-                # _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                token_idx, _ = torch.where(router_indices == expert_idx)
+            count = counts[expert_idx]
+            if count == 0:
+                continue
+            
+            # Use pre-computed indices (no torch.where needed)
+            token_idx = sorted_tokens[offset:offset + count]
             current_state = hidden_states[token_idx]
+            
             gate_up = self.gate_up_projs[expert_idx](current_state)
             down_proj = self.down_projs[expert_idx]
             gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
-            # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-            # gate = gate.clamp(min=None, max=self.limit)
-            # up = up.clamp(min=-self.limit, max=self.limit)
-            # glu = gate * torch.sigmoid(gate * self.alpha)
-            # gated_output = (up + 1) * glu
 
-            # Force float32 matrix multiply on some down projection modules
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
             with torch.autocast(device_type=device_type, enabled=False): # Force float32
                 out = down_proj(gated_output)
+            
             weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
             next_states.index_add_(0, token_idx, weighted_output)
+            
+            offset += count
         next_states = next_states.view(batch_size, -1, self.hidden_size)
         return next_states.to(torch.float32)
     else:
@@ -1839,6 +1867,11 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    # Uncompiled flex_attention backward has a dtype bug in PyTorch
+    # (sdpa_dense_backward: expected Float got BFloat16). The inplace eager
+    # fallback also uses out= matmul which is incompatible with autograd.
+    # Skip the patch and let stock transformers eager attention handle sinks.
+    if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         from ..flex_attention import (
@@ -1874,6 +1907,27 @@ def patch_GptOssAttention():
     F_softmax = torch.nn.functional.softmax
     F_dropout = nn.functional.dropout
     matmul = torch.matmul
+    def _align_kv_to_mask(key_states, value_states, attention_mask):
+        # Eager attention does `attn_weights += attention_mask`, which requires the
+        # key/value length to equal the mask's key dimension. On some
+        # transformers/torch combinations (e.g. transformers 5.x on torch < 2.11)
+        # the KV cache hands back more positions than the causal mask covers
+        # (pre-allocated cache slots), so a full-attention layer can see e.g. 161
+        # keys against a 128-wide mask and crash. The surplus positions are masked
+        # out anyway, so attend only the overlap by trimming KV (and the mask) to
+        # the shorter length. This keeps the path correct and shape-consistent
+        # across transformers/torch versions.
+        if attention_mask is None or not hasattr(attention_mask, "shape"):
+            return key_states, value_states, attention_mask
+        kvlen = key_states.shape[-2]
+        masklen = attention_mask.shape[-1]
+        if masklen < kvlen:
+            key_states = key_states[:, :, :masklen, :]
+            value_states = value_states[:, :, :masklen, :]
+        elif masklen > kvlen:
+            attention_mask = attention_mask[:, :, :, :kvlen]
+        return key_states, value_states, attention_mask
+
     def inplace_eager_attention_forward(
         module: nn.Module,
         query: torch.Tensor,
@@ -1886,6 +1940,9 @@ def patch_GptOssAttention():
     ):
         key_states = repeat_kv(key, module.num_key_value_groups)
         value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
 
         bsz, n_heads, qlen, _  = query.shape
         bsz, n_heads, kvlen, _ = key_states.shape
@@ -1928,6 +1985,9 @@ def patch_GptOssAttention():
     ):
         key_states = repeat_kv(key, module.num_key_value_groups)
         value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
         attn_weights = matmul(query, key_states.transpose(2, 3))
         attn_weights *= scaling
         if attention_mask is not None:
@@ -2071,6 +2131,28 @@ def patch_GptOssAttention():
         return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
 
     functions.append(forward)
+
+    # Transformers >= 5.0 dropped `cache_position` from GptOssAttention.forward's
+    # signature, so the variants above fail the strict signature match and the
+    # attention patch silently does not apply (leaving stock attention, which
+    # then mismatches the sliding-window mask the model patch builds). Add a
+    # `past_key_values` variant without `cache_position` (it still arrives via
+    # **kwargs) so the patch installs on transformers 5.x too. Only the
+    # `past_key_values` spelling is needed: the singular `past_key_value` naming
+    # predates transformers dropping `cache_position`, so a singular + no
+    # `cache_position` signature does not exist in any transformers release.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        cache_position = kwargs.pop("cache_position", None)
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+
+    functions.append(forward)
     patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
@@ -2080,6 +2162,7 @@ TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -2121,7 +2204,31 @@ def patch_GptOssModel():
                         return arg
                 return f(*args, **kwargs)
             else:
-                # Eager
+                # Eager inference path. The config may still have
+                # _attn_implementation="flex_attention" (set for training), in
+                # which case the underlying mask factory returns a BlockMask.
+                # Unsloth uses eager attention for inference (flex with KV
+                # cache returns gibberish, see forward_function above), and
+                # the eager forward cannot index a BlockMask, raising
+                #   TypeError: unsupported operand type(s) for +=:
+                #       'Tensor' and 'BlockMask'
+                # Temporarily swap to eager so the factory returns a dense
+                # 4D float mask (0 / -inf) the eager path can consume.
+                config = kwargs.get("config", None)
+                if config is None:
+                    for arg in args:
+                        if hasattr(arg, "_attn_implementation"):
+                            config = arg
+                            break
+                if config is not None and getattr(
+                    config, "_attn_implementation", None
+                ) == "flex_attention":
+                    original_impl = config._attn_implementation
+                    config._attn_implementation = "eager"
+                    try:
+                        return f(*args, **kwargs)
+                    finally:
+                        config._attn_implementation = original_impl
                 return f(*args, **kwargs)
             pass
         return return_attention_mask
@@ -2151,6 +2258,29 @@ def patch_GptOssModel():
         transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
         transformers.masking_utils.__patched_causal_mask__ = True
     pass
+
+    # transformers 4.x uses `input_embeds` and accepts `cache_position`;
+    # transformers 5.x renamed to `inputs_embeds` and dropped `cache_position`.
+    # Inspect the mask factory signatures once and pass only the kwargs they
+    # actually accept so this patch works on both 4.x and 5.x.
+    import inspect as _inspect
+    _ccm_params = set(_inspect.signature(create_causal_mask).parameters)
+    _cswc_params = set(_inspect.signature(create_sliding_window_causal_mask).parameters)
+    _mask_params = _ccm_params | _cswc_params
+
+    def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):
+        mk = {
+            "config": config,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+        }
+        if "inputs_embeds" in _mask_params:
+            mk["inputs_embeds"] = inputs_embeds
+        if "input_embeds" in _mask_params:
+            mk["input_embeds"] = inputs_embeds
+        if "cache_position" in _mask_params:
+            mk["cache_position"] = cache_position
+        return mk
 
     from ..flex_attention import (
         is_flex_attention_decoding,
@@ -2311,7 +2441,6 @@ def patch_GptOssModel():
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -2327,6 +2456,7 @@ def patch_GptOssModel():
         if not self.training:
             inputs_embeds.requires_grad_(False)
 
+        cache_position = kwargs.pop("cache_position", None)
         if cache_position is None:
             past_seen_tokens = (past_key_values.get_seq_length() if past_key_values is not None else 0)
             cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
@@ -2344,17 +2474,33 @@ def patch_GptOssModel():
 
         # It may already have been prepared by e.g. `generate`
         if not self.training and not isinstance(attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            attention_mask = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+            # Inference uses eager attention. If the config still has
+            # _attn_implementation="flex_attention" (set for training), the
+            # mask factory returns a BlockMask which eager cannot consume.
+            # Temporarily swap to "eager" so a dense 4D float mask is built.
+            _orig_attn_impl = getattr(self.config, "_attn_implementation", None)
+            _swap_attn_impl = _orig_attn_impl == "flex_attention"
+            if _swap_attn_impl:
+                self.config._attn_implementation = "eager"
+            try:
+                mask_kwargs = _build_mask_kwargs(
+                    config=self.config,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                )
+                attention_mask = {
+                    "full_attention": create_causal_mask(**{
+                        k: v for k, v in mask_kwargs.items() if k in _ccm_params
+                    }),
+                    "sliding_attention": create_sliding_window_causal_mask(**{
+                        k: v for k, v in mask_kwargs.items() if k in _cswc_params
+                    }),
+                }
+            finally:
+                if _swap_attn_impl:
+                    self.config._attn_implementation = _orig_attn_impl
 
         # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         bsz, qlen, hd = hidden_states.shape
@@ -2365,10 +2511,15 @@ def patch_GptOssModel():
             # Initialize for common return path
             all_hidden_states = None
             for decoder_layer in self.layers:
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
                 hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
-                    attention_mask[decoder_layer.attention_type],
+                    mask,
                     position_ids,
                     past_key_values,
                     use_cache,
@@ -2410,7 +2561,11 @@ def patch_GptOssModel():
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
 
-                mask = (attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask)
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=mask,
